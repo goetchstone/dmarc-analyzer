@@ -52,7 +52,7 @@ Needs Python 3.9+ with tkinter (python.org installers include it;
 Homebrew users: `brew install python-tk`).
 
 ```bash
-git clone https://github.com/OWNER/dmarc-analyzer.git
+git clone https://github.com/goetchstone/dmarc-analyzer.git
 cd dmarc-analyzer
 pip3 install dnspython tkinterdnd2
 python3 dmarc_analyzer.py
