@@ -1,0 +1,3 @@
+dnspython>=2.0
+# Optional — native drag-and-drop from Finder:
+tkinterdnd2>=0.4

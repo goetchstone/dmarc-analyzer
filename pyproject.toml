@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dmarc-analyzer"
+version = "1.1.0"
+description = "Local macOS GUI for parsing DMARC aggregate reports (RFC 7489) with SQLite persistence and live DNS lookups"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "dnspython>=2.0",
+]
+
+[project.optional-dependencies]
+# Native drag-and-drop from Finder
+dnd = ["tkinterdnd2>=0.4"]
+
+[project.gui-scripts]
+dmarc-analyzer = "dmarc_analyzer:main"
+
+[tool.setuptools]
+py-modules = ["dmarc_analyzer"]
