@@ -61,7 +61,7 @@ python3 dmarc_analyzer.py
 Or install as a command with [pipx](https://pipx.pypa.io):
 
 ```bash
-pipx install "dmarc-analyzer[dnd] @ git+https://github.com/OWNER/dmarc-analyzer.git"
+pipx install "dmarc-analyzer[dnd] @ git+https://github.com/goetchstone/dmarc-analyzer.git"
 dmarc-analyzer
 ```
 
