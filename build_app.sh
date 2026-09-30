@@ -7,6 +7,12 @@
 # End result needs nothing installed on the machine that runs it.
 set -euo pipefail
 cd "$(dirname "$0")"
+# The clean step below runs rm -rf here, so make sure "here" is the repo
+# (dirname of a symlink or of `bash < build_app.sh` would be somewhere else)
+if [[ ! -f dmarc_analyzer.py || ! -f "DMARC Analyzer.spec" ]]; then
+    echo "ERROR: run build_app.sh from inside the dmarc-analyzer folder." >&2
+    exit 1
+fi
 
 # ── Preflight ────────────────────────────────────────────────────────────────
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -20,8 +26,12 @@ if ! command -v "$PY" >/dev/null; then
     exit 1
 fi
 
-if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)'; then
-    echo "ERROR: Python 3.9+ required. Found: $("$PY" --version)" >&2
+if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
+    cat >&2 <<EOF
+ERROR: Python 3.10+ required. Found: $("$PY" --version)
+The Python 3.9 that ships with macOS is too old (and its Tk and XML
+parser are outdated). Install Python from https://python.org, then re-run.
+EOF
     exit 1
 fi
 
@@ -49,11 +59,12 @@ rm -rf build_venv build dist
 "$PY" -m venv build_venv
 # shellcheck disable=SC1091
 source build_venv/bin/activate
-pip install --quiet --upgrade pip
-pip install --quiet dnspython tkinterdnd2 "pyinstaller>=6.0"
+# Exact versions this build was verified with — whatever is installed here
+# gets frozen into the app, so bump these deliberately, not implicitly
+pip install --quiet "dnspython==2.8.0" "tkinterdnd2==0.6.3" "pyinstaller==6.22.3"
 
 # ── Build ────────────────────────────────────────────────────────────────────
-echo "Building app bundle (1–2 minutes)…"
+echo "Building app bundle (usually under a minute)…"
 pyinstaller --noconfirm --log-level WARN "DMARC Analyzer.spec"
 deactivate
 
@@ -79,7 +90,8 @@ else
 fi
 
 echo
-echo "Note: the app is unsigned. It runs fine on THIS Mac (locally built apps"
-echo "carry no quarantine flag). If you copy it to another Mac, Gatekeeper will"
-echo "block first launch — right-click the app > Open, or run:"
+echo "Note: the app is ad-hoc signed, not notarized. It runs fine on THIS Mac"
+echo "(locally built apps carry no quarantine flag). If you copy it to another"
+echo "Mac, Gatekeeper will block first launch — allow it in System Settings >"
+echo "Privacy & Security (Open Anyway), or run:"
 echo "  xattr -dr com.apple.quarantine '/Applications/DMARC Analyzer.app'"

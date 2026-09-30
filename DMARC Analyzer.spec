@@ -59,12 +59,12 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "DMARC Analyzer",
         "CFBundleDisplayName": "DMARC Analyzer",
-        "CFBundleShortVersionString": "1.1.0",
-        "CFBundleVersion": "1.1.0",
+        "CFBundleShortVersionString": "1.2.0",
+        "CFBundleVersion": "1.2.0",
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "11.0",
         "LSApplicationCategoryType": "public.app-category.utilities",
-        # Lets Finder offer this app for .xml / .gz files and enables
+        # Lets Finder offer this app for .xml / .gz / .zip files and enables
         # drops onto the Dock icon (handled via ::tk::mac::OpenDocument).
         "CFBundleDocumentTypes": [
             {
@@ -74,8 +74,9 @@ app = BUNDLE(
                 "LSItemContentTypes": [
                     "public.xml",
                     "org.gnu.gnu-zip-archive",
+                    "public.zip-archive",
                 ],
-                "CFBundleTypeExtensions": ["xml", "gz"],
+                "CFBundleTypeExtensions": ["xml", "gz", "zip"],
             },
         ],
     },

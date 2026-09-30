@@ -1,0 +1,12 @@
+# Build output from build_app.sh / PyInstaller
+build_venv/
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local databases and macOS clutter
+*.db
+.DS_Store
