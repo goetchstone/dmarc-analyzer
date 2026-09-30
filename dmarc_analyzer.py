@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """
 DMARC Report Analyzer
-- Parse .xml and .xml.gz DMARC aggregate reports (RFC 7489)
+- Parse .xml, .xml.gz and .zip DMARC aggregate reports (RFC 7489)
 - DNS lookup for DMARC, SPF, DKIM records on any domain
 - Drag-and-drop or file picker for reports
 - Tabular view with pass/fail highlighting
 - Summary stats per report and across reports
 
-Requires: Python 3.9+, dnspython
+Requires: Python 3.10+, dnspython
   pip3 install dnspython
 """
 
 import gzip
+import ipaddress
 import json
 import os
-import re
-import socket
 import sqlite3
 import sys
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
 import xml.etree.ElementTree as ET
+import xml.parsers.expat
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+if sys.version_info < (3, 10):
+    sys.exit("DMARC Analyzer needs Python 3.10 or newer — the Python 3.9 that "
+             "ships with macOS is too old. Install one from python.org.")
 
 try:
     import dns.resolver
@@ -41,9 +46,9 @@ except ImportError:
 TEXT      = "#1a1a1a"
 MUTED     = "#6c757d"
 PASS_BG   = "#d4edda"
+PASS_ALT  = "#e6f4ea"   # zebra stripe for pass rows — still reads as green
 FAIL_BG   = "#f8d7da"
 WARN_BG   = "#fff3cd"
-NONE_BG   = "#f8f9fa"
 HEADER_BG = "#343a40"
 HEADER_FG = "#ffffff"
 ROW_ALT   = "#f2f2f2"
@@ -52,27 +57,99 @@ APP_BG    = "#ffffff"
 SIDEBAR   = "#f8f9fa"
 BORDER    = "#dee2e6"
 
+COLUMNS = ("Source IP", "Count", "Disposition", "DKIM", "SPF",
+           "Overall", "Header From", "Envelope From", "Org", "Report Date")
+
 
 # ── XML Parsing ───────────────────────────────────────────────────────────────
+# Reports are email attachments from arbitrary senders, so treat them as
+# hostile: bound what gets decompressed and how many nodes get built, and
+# refuse DTDs outright. Real reports never have one, and refusing them rules
+# out entity-expansion tricks whatever expat version Python was built with.
+
+MAX_REPORT_BYTES = 25 * 1024 * 1024   # uncompressed XML
+MAX_XML_ELEMENTS = 1_000_000           # roughly 40k records
+MAX_FIELD_CHARS  = 1024
+MAX_COUNT        = 10**9               # per record; keeps SQLite SUM() far from int64
+
 
 def _txt(el, path, default=""):
     node = el.find(path)
-    return node.text.strip() if node is not None and node.text else default
+    if node is None or not node.text:
+        return default
+    text = node.text.strip()
+    if len(text) > MAX_FIELD_CHARS:
+        raise ValueError(f"<{path}> is longer than {MAX_FIELD_CHARS} characters")
+    return text
+
+
+def _read_capped(f) -> bytes:
+    data = f.read(MAX_REPORT_BYTES + 1)
+    if len(data) > MAX_REPORT_BYTES:
+        raise ValueError(f"report is larger than {MAX_REPORT_BYTES // 2**20} MB uncompressed")
+    return data
+
+
+def _read_report_bytes(path: str) -> bytes:
+    """Raw XML from a .xml, .xml.gz or .zip report. The format is detected
+    from the file's content, not its extension."""
+    with open(path, "rb") as f:
+        magic = f.read(4)
+    if magic[:2] == b"\x1f\x8b":
+        with gzip.open(path, "rb") as f:
+            return _read_capped(f)
+    if magic == b"PK\x03\x04":
+        # Google sends one .xml per zip. It is read in memory — nothing is
+        # extracted to disk, so member paths can't escape anywhere.
+        with zipfile.ZipFile(path) as zf:
+            xmls = [m for m in zf.infolist()
+                    if not m.is_dir() and m.filename.lower().endswith(".xml")]
+            if len(xmls) != 1:
+                raise ValueError(f"expected one .xml file in the zip, found {len(xmls)}")
+            with zf.open(xmls[0]) as f:
+                return _read_capped(f)
+    with open(path, "rb") as f:
+        return _read_capped(f)
+
+
+def _check_xml(raw: bytes):
+    """Streaming pre-pass that builds no tree: refuse DTDs and cap the
+    element count before ElementTree allocates anything."""
+    n = 0
+
+    def _element(*_):
+        nonlocal n
+        n += 1
+        if n > MAX_XML_ELEMENTS:
+            raise ValueError(f"more than {MAX_XML_ELEMENTS:,} XML elements")
+
+    def _refuse(*_):
+        raise ValueError("DTD/entity declarations are not allowed in a DMARC report")
+
+    p = xml.parsers.expat.ParserCreate()
+    p.StartElementHandler = _element
+    p.StartDoctypeDeclHandler = _refuse
+    p.EntityDeclHandler = _refuse
+    p.Parse(raw, True)
 
 
 def parse_report(path: str) -> dict:
-    """Parse one DMARC XML or XML.gz file into a dict."""
+    """Parse one DMARC report (.xml, .xml.gz or .zip) into a dict."""
     path = str(path)
     try:
-        if path.endswith(".gz"):
-            with gzip.open(path, "rb") as f:
-                raw = f.read()
-        else:
-            with open(path, "rb") as f:
-                raw = f.read()
+        raw = _read_report_bytes(path)
+        _check_xml(raw)
         root = ET.fromstring(raw)
     except Exception as e:
         raise ValueError(f"Cannot parse {path}: {e}")
+
+    # Some reporters, and the DMARCbis drafts, put the whole report in a
+    # default XML namespace; drop it so the plain-tag lookups below match.
+    for el in root.iter():
+        if isinstance(el.tag, str) and el.tag.startswith("{"):
+            el.tag = el.tag.split("}", 1)[1]
+    if root.tag != "feedback":
+        raise ValueError(f"not a DMARC aggregate report (root element is <{root.tag}>)")
 
     _meta = root.find("report_metadata"); meta = _meta if _meta is not None else ET.Element("x")
     _pol  = root.find("policy_published"); pol  = _pol  if _pol  is not None else ET.Element("x")
@@ -96,6 +173,10 @@ def parse_report(path: str) -> dict:
         "aspf":        _txt(pol,  "aspf"),
         "records":     [],
     }
+    # (org, report_id) is the duplicate-detection key: without an id, every
+    # such file would collide and later ones would be dropped as "duplicates"
+    if not report["report_id"]:
+        raise ValueError("report has no <report_id>")
 
     for rec in root.findall("record"):
         _row = rec.find("row")
@@ -123,10 +204,13 @@ def parse_report(path: str) -> dict:
                 "result": _txt(s, "result"),
             })
 
-        dkim_eval = _txt(row, "policy_evaluated/dkim")
-        spf_eval  = _txt(row, "policy_evaluated/spf")
-        disp      = _txt(row, "policy_evaluated/disposition")
+        # The schema says lower-case, but some reporters send "Pass"
+        dkim_eval = _txt(row, "policy_evaluated/dkim").lower()
+        spf_eval  = _txt(row, "policy_evaluated/spf").lower()
+        disp      = _txt(row, "policy_evaluated/disposition").lower()
         count     = int(_txt(row, "count") or 1)
+        if not 0 <= count <= MAX_COUNT:
+            raise ValueError(f"record <count> {count} is out of range")
 
         # Overall result for the record
         if dkim_eval == "pass" or spf_eval == "pass":
@@ -205,34 +289,38 @@ class ReportDB:
         self.path = str(path)
         self.conn = sqlite3.connect(self.path)
         self.conn.execute("PRAGMA foreign_keys = ON")
+        # "Remove" / "Clear All" promise permanent deletion: overwrite freed
+        # pages instead of leaving the old rows readable in the file
+        self.conn.execute("PRAGMA secure_delete = ON")
         self.conn.executescript(self.SCHEMA)
         self.conn.commit()
 
     def insert_report(self, rep: dict) -> int | None:
-        """Insert a parsed report. Returns the new row id, or None if duplicate."""
-        cur = self.conn.execute(
-            """INSERT OR IGNORE INTO reports
-               (org, report_id, domain, begin_ts, end_ts,
-                policy_p, policy_sp, policy_pct, adkim, aspf, source_file)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (rep["org"], rep["report_id"], rep["domain"],
-             rep["begin_ts"], rep["end_ts"],
-             rep["policy_p"], rep["policy_sp"], rep["policy_pct"],
-             rep["adkim"], rep["aspf"], rep["file"]))
-        if cur.rowcount == 0:
-            return None  # duplicate (org, report_id)
-        rid = cur.lastrowid
-        self.conn.executemany(
-            """INSERT INTO records
-               (report_fk, source_ip, count, disposition, dkim_eval, spf_eval,
-                overall, header_from, envelope_from, dkim_results, spf_results)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            [(rid, r["source_ip"], r["count"], r["disposition"],
-              r["dkim_eval"], r["spf_eval"], r["overall"],
-              r["header_from"], r["envelope_from"],
-              json.dumps(r["dkim_results"]), json.dumps(r["spf_results"]))
-             for r in rep["records"]])
-        self.conn.commit()
+        """Insert a parsed report. Returns the new row id, or None if duplicate.
+        One transaction: a failure part-way never leaves a partial report."""
+        with self.conn:
+            cur = self.conn.execute(
+                """INSERT OR IGNORE INTO reports
+                   (org, report_id, domain, begin_ts, end_ts,
+                    policy_p, policy_sp, policy_pct, adkim, aspf, source_file)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (rep["org"], rep["report_id"], rep["domain"],
+                 rep["begin_ts"], rep["end_ts"],
+                 rep["policy_p"], rep["policy_sp"], rep["policy_pct"],
+                 rep["adkim"], rep["aspf"], rep["file"]))
+            if cur.rowcount == 0:
+                return None  # duplicate (org, report_id)
+            rid = cur.lastrowid
+            self.conn.executemany(
+                """INSERT INTO records
+                   (report_fk, source_ip, count, disposition, dkim_eval, spf_eval,
+                    overall, header_from, envelope_from, dkim_results, spf_results)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                [(rid, r["source_ip"], r["count"], r["disposition"],
+                  r["dkim_eval"], r["spf_eval"], r["overall"],
+                  r["header_from"], r["envelope_from"],
+                  json.dumps(r["dkim_results"]), json.dumps(r["spf_results"]))
+                 for r in rep["records"]])
         return rid
 
     def load_all(self) -> list[dict]:
@@ -281,8 +369,10 @@ class ReportDB:
     def stats(self) -> tuple[int, int, int]:
         """(report count, record rows, total message count)"""
         n_rep = self.conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+        # TOTAL() never raises on overflow the way SUM() does, so one bad row
+        # can't stop the app from starting (stats() runs at launch)
         n_rec, n_msg = self.conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(count), 0) FROM records").fetchone()
+            "SELECT COUNT(*), CAST(TOTAL(count) AS INTEGER) FROM records").fetchone()
         return n_rep, n_rec, n_msg
 
 
@@ -299,7 +389,9 @@ def lookup_dmarc(domain: str) -> str:
             if s.startswith("v=DMARC1"):
                 txts.append(s)
         return "\n".join(txts) if txts else "No DMARC record found"
-    except dns.exception.DNSException as e:
+    # Not just DNSException: a "\999" escape in a report-supplied name raises
+    # struct.error, which would otherwise kill the lookup thread
+    except Exception as e:
         return f"DNS error: {e}"
 
 
@@ -314,7 +406,7 @@ def lookup_spf(domain: str) -> str:
             if "v=spf1" in s.lower():
                 txts.append(s)
         return "\n".join(txts) if txts else "No SPF record found"
-    except dns.exception.DNSException as e:
+    except Exception as e:
         return f"DNS error: {e}"
 
 
@@ -325,7 +417,7 @@ def lookup_mx(domain: str) -> str:
         answers = dns.resolver.resolve(domain, "MX")
         lines = sorted(f"{r.preference:5d}  {r.exchange}" for r in answers)
         return "\n".join(lines) if lines else "No MX records found"
-    except dns.exception.DNSException as e:
+    except Exception as e:
         return f"DNS error: {e}"
 
 
@@ -340,15 +432,26 @@ def lookup_dkim(domain: str, selector: str) -> str:
             s = b"".join(rdata.strings).decode("utf-8", errors="replace")
             txts.append(s)
         return "\n".join(txts) if txts else f"No DKIM record at {host}"
-    except dns.exception.DNSException as e:
+    except Exception as e:
         return f"DNS error ({host}): {e}"
 
 
-def reverse_ip(ip: str) -> str:
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except Exception:
-        return ""
+def dns_result_bg(title: str, text: str) -> str:
+    """Background colour for a DNS result box, judged from what the lookup
+    returned. Substring matching is unsafe here: error text echoes the
+    queried name, so a lookup of e.g. passport.com would read as a pass."""
+    if text.startswith(("DNS error", "No ", "dnspython not installed", "(no selector")):
+        return FAIL_BG
+    if title == "MX Records":
+        return SIDEBAR  # informational; there's no pass/fail for MX
+    if title == "DKIM Record":
+        tags = {}
+        for part in text.split(";"):
+            key, _, value = part.partition("=")
+            tags[key.strip()] = value.strip()
+        if not tags.get("p"):
+            return WARN_BG  # an empty p= means the key has been revoked
+    return PASS_BG
 
 
 # ── Main Application ──────────────────────────────────────────────────────────
@@ -470,7 +573,7 @@ class DMARCApp(tk.Tk):
         tk.Label(self.drop_frame, text="⬇", font=("Helvetica", 48),
                  bg=SIDEBAR, fg="#adb5bd").pack(pady=(28, 4))
         tk.Label(self.drop_frame,
-                 text="Drop DMARC XML or .xml.gz files here\nor click  Open Files…  above",
+                 text="Drop DMARC .xml, .xml.gz or .zip files here\nor click  Open Files…  above",
                  bg=SIDEBAR, fg="#6c757d", font=("Helvetica", 12),
                  justify=tk.CENTER).pack()
 
@@ -545,8 +648,7 @@ class DMARCApp(tk.Tk):
         self.stat_lbl.pack(side=tk.RIGHT, padx=12)
 
         # Table
-        cols = ("Source IP", "Count", "Disposition", "DKIM", "SPF",
-                "Overall", "Header From", "Envelope From", "Org", "Report Date")
+        cols = COLUMNS
         tbl_frame = tk.Frame(right, bg=APP_BG)
         tbl_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -579,23 +681,29 @@ class DMARCApp(tk.Tk):
         self.tree.tag_configure("pass",    background=PASS_BG, foreground=TEXT)
         self.tree.tag_configure("fail",    background=FAIL_BG, foreground=TEXT)
         self.tree.tag_configure("warn",    background=WARN_BG, foreground=TEXT)
-        self.tree.tag_configure("neutral", background=NONE_BG, foreground=TEXT)
+        self.tree.tag_configure("pass_alt", background=PASS_ALT, foreground=TEXT)
         self.tree.tag_configure("alt",     background=ROW_ALT, foreground=TEXT)
 
         self.tree.bind("<<TreeviewSelect>>", self._on_row_select)
 
         # Detail pane below table
-        detail_outer = tk.Frame(right, bg=SIDEBAR, height=130)
+        # Tall enough for the usual header + DKIM + SPF lines; the scrollbar
+        # covers records carrying several DKIM signatures
+        detail_outer = tk.Frame(right, bg=SIDEBAR, height=180)
         detail_outer.pack(fill=tk.X)
         detail_outer.pack_propagate(False)
 
         tk.Label(detail_outer, text="Record Detail",
                  bg=SIDEBAR, fg=TEXT, font=("Helvetica", 9, "bold"),
                  anchor=tk.W).pack(fill=tk.X, padx=8, pady=(6, 0))
+        detail_sb = ttk.Scrollbar(detail_outer)
+        detail_sb.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 6), pady=(0, 6))
         self.detail_text = tk.Text(detail_outer, height=6, bg=SIDEBAR, fg=TEXT,
                                     relief=tk.FLAT, font=("Courier", 10),
-                                    state=tk.DISABLED, wrap=tk.WORD)
-        self.detail_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+                                    state=tk.DISABLED, wrap=tk.WORD,
+                                    yscrollcommand=detail_sb.set)
+        detail_sb.config(command=self.detail_text.yview)
+        self.detail_text.pack(fill=tk.BOTH, expand=True, padx=(8, 0), pady=(0, 6))
 
         self._report_frame = right
         self._all_rows: list[tuple] = []  # raw rows for filtering
@@ -713,14 +821,7 @@ class DMARCApp(tk.Tk):
             txt_widget.delete("1.0", tk.END)
             val = results.get(title, "")
             txt_widget.insert(tk.END, val)
-            # Colour background based on content
-            if "pass" in val.lower() or val.startswith("v="):
-                txt_widget.config(bg=PASS_BG)
-            elif "not found" in val.lower() or "no " in val.lower() or "error" in val.lower():
-                txt_widget.config(bg=FAIL_BG)
-            else:
-                txt_widget.config(bg=SIDEBAR)
-            txt_widget.config(state=tk.DISABLED)
+            txt_widget.config(bg=dns_result_bg(title, val), state=tk.DISABLED)
 
     # ── File Loading ──────────────────────────────────────────────────────────
 
@@ -735,6 +836,7 @@ class DMARCApp(tk.Tk):
             filetypes=[
                 ("DMARC reports", "*.xml"),
                 ("Compressed reports", "*.gz"),
+                ("Zipped reports", "*.zip"),
                 ("All files", "*"),
             ],
         )
@@ -853,10 +955,11 @@ class DMARCApp(tk.Tk):
         n_pass  = sum(rec["count"] for rec in rep["records"] if rec["overall"] == "pass")
         n_fail  = sum(rec["count"] for rec in rep["records"] if rec["overall"] == "fail")
         pct     = f"{100*n_pass//total}%" if total else "—"
+        policy_pct = f"{rep['policy_pct']}%" if rep["policy_pct"] else "—"
         summary = (
             f"Domain: {rep['domain']}\n"
-            f"Policy: p={rep['policy_p']} sp={rep['policy_sp']} pct={rep['policy_pct']}%\n"
-            f"adkim={rep['adkim']}  aspf={rep['aspf']}\n"
+            f"Policy: p={rep['policy_p'] or '—'} sp={rep['policy_sp'] or '—'} pct={policy_pct}\n"
+            f"adkim={rep['adkim'] or '—'}  aspf={rep['aspf'] or '—'}\n"
             f"Messages: {total:,}  Pass: {n_pass:,}  Fail: {n_fail:,}  ({pct} pass rate)\n"
             f"Period: {rep['begin']} → {rep['end']}"
         )
@@ -904,10 +1007,13 @@ class DMARCApp(tk.Tk):
                 continue
 
             tag = rec["overall"]  # "pass" or "fail"
-            if tag == "pass" and i % 2 == 0:
-                tag = "neutral"  # alternate row
-            self.tree.insert("", tk.END, values=row, tags=(tag,))
+            if tag == "pass" and shown % 2:
+                tag = "pass_alt"  # zebra stripe, still green
+            # iid = index into _all_rows, so a selection maps back to exactly
+            # this record (IP + count alone isn't unique)
+            self.tree.insert("", tk.END, iid=str(i), values=row, tags=(tag,))
             shown += 1
+        self._apply_sort()
 
         total = sum(rec["count"] for _, rec, _ in self._all_rows)
         self.stat_lbl.config(text=f"{shown} rows shown  |  {total:,} total messages")
@@ -920,22 +1026,7 @@ class DMARCApp(tk.Tk):
         sel = self.tree.selection()
         if not sel:
             return
-        values = self.tree.item(sel[0], "values")
-        if not values:
-            return
-
-        # Find matching record for detail
-        src_ip = values[0]
-        count  = values[1]
-        matched_rec = matched_rep = None
-        for row, rec, rep in self._all_rows:
-            if row[0] == src_ip and row[1] == count:
-                matched_rec = rec
-                matched_rep = rep
-                break
-
-        if not matched_rec:
-            return
+        _, matched_rec, matched_rep = self._all_rows[int(sel[0])]
 
         lines = [
             f"Source IP:     {matched_rec['source_ip']}",
@@ -957,31 +1048,43 @@ class DMARCApp(tk.Tk):
         self.detail_text.insert(tk.END, "\n".join(lines))
         self.detail_text.config(state=tk.DISABLED)
 
-        # Also jump to DNS tab and populate domain
-        if matched_rep:
-            self.dns_domain_var.set(matched_rep["domain"])
+        # Prefill the DNS tab with the report's domain (the lookup itself
+        # only runs when the user asks)
+        self.dns_domain_var.set(matched_rep["domain"])
 
     # ── Sorting ───────────────────────────────────────────────────────────────
 
     def _sort_by(self, col):
-        cols = ("Source IP", "Count", "Disposition", "DKIM", "SPF",
-                "Overall", "Header From", "Envelope From", "Org", "Report Date")
-        if col not in cols:
+        if col not in COLUMNS:
             return
-        idx = cols.index(col)
-
         if self._sort_col == col:
             self._sort_rev = not self._sort_rev
         else:
             self._sort_col = col
             self._sort_rev = False
+        self._apply_sort()
 
+    def _apply_sort(self):
+        """Order the visible rows by the current sort column. Also called
+        after every refresh so filtering keeps the order the arrow shows."""
+        col = self._sort_col
+        if col is None:
+            return
+        idx = COLUMNS.index(col)
+
+        # One key type per column: mixing int and str (e.g. a Header From
+        # of "12345") would make sort() raise
         def key(item):
-            v = self.tree.item(item, "values")[idx]
-            try:
+            v = str(self.tree.item(item, "values")[idx])
+            if col == "Count":
                 return int(v)
-            except ValueError:
-                return v.lower()
+            if col == "Source IP":
+                try:
+                    ip = ipaddress.ip_address(v)
+                    return (ip.version, int(ip), "")
+                except ValueError:
+                    return (99, 0, v)
+            return v.lower()
 
         items = list(self.tree.get_children(""))
         items.sort(key=key, reverse=self._sort_rev)
@@ -989,7 +1092,7 @@ class DMARCApp(tk.Tk):
             self.tree.move(item, "", i)
 
         # Update heading to show sort direction
-        for c in cols:
+        for c in COLUMNS:
             arrow = ""
             if c == col:
                 arrow = " ▲" if not self._sort_rev else " ▼"
@@ -1012,17 +1115,9 @@ class DMARCApp(tk.Tk):
             pass  # Fallback: use file picker only
 
     def _on_dnd_drop(self, event):
-        # tkinterdnd2 returns a brace-wrapped string on macOS
-        raw = event.data
-        paths = []
-        if raw.startswith("{"):
-            import re
-            paths = re.findall(r'\{([^}]+)\}', raw)
-            remainder = re.sub(r'\{[^}]+\}', '', raw).split()
-            paths.extend(remainder)
-        else:
-            paths = raw.split()
-        self._load_files([p.strip() for p in paths if p.strip()])
+        # tkdnd delivers a Tcl list (paths with spaces are brace-quoted,
+        # odd characters backslash-escaped) — let Tcl itself split it
+        self._load_files([p for p in self.tk.splitlist(event.data) if p])
 
     def _setup_mac_open(self):
         """
@@ -1072,7 +1167,14 @@ def main():
                 stray.destroy()
             except Exception:
                 pass
-        app = DMARCApp()
+        try:
+            app = DMARCApp()
+        except Exception as e:
+            # Same problem one level up: with no console, a startup failure
+            # (e.g. an unreadable database) would just make the app vanish
+            messagebox.showerror("DMARC Analyzer could not start",
+                                 f"{type(e).__name__}: {e}")
+            raise
 
     app.mainloop()
 
