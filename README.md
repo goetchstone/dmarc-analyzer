@@ -1,22 +1,27 @@
 # DMARC Analyzer
 
 A local macOS desktop app for reading DMARC aggregate reports (RFC 7489).
-Drag in the `.xml` / `.xml.gz` attachments that mailbox providers send to
-your `rua=` address, see every source IP with pass/fail highlighting, and
-look up live DMARC/SPF/DKIM/MX records for any domain.
+Drag in the `.xml`, `.xml.gz` or `.zip` attachments that mailbox providers
+send to your `rua=` address, see every source IP with pass/fail
+highlighting, and look up live DMARC/SPF/DKIM/MX records for any domain.
 
 Everything runs on your machine. No accounts, no telemetry, no uploads —
 the only network traffic is the DNS queries you trigger yourself. Imported
 reports persist in a local SQLite database
 (`~/Library/Application Support/DMARCAnalyzer/dmarc.db`).
 
-<!-- TODO: add docs/screenshot.png and uncomment -->
-<!-- ![screenshot](docs/screenshot.png) -->
+![Reports view: per-source-IP results with pass/fail highlighting and the record detail pane](docs/screenshot-reports.png)
+
+![DNS Lookup tab: live DMARC, SPF, DKIM and MX records for a domain](docs/screenshot-dns.png)
+
+<sub>Screenshots use synthetic reports: reserved `example.*` domains and
+documentation IP ranges.</sub>
 
 ## Features
 
-- Parses aggregate reports from any RFC 7489-compliant reporter (tested
-  against Google, Microsoft, Comcast, Fastmail output)
+- Parses RFC 7489 aggregate reports — the XML format mailbox providers such
+  as Google and Microsoft send — whether it arrives as `.xml`, `.xml.gz` or
+  `.zip`
 - Per-source-IP table: disposition, DKIM/SPF evaluation, alignment result,
   header-from vs envelope-from, sortable and filterable, failures-only toggle
 - Record detail view showing every DKIM selector and SPF scope the reporter
@@ -24,58 +29,52 @@ reports persist in a local SQLite database
 - Live DNS tab: DMARC, SPF, DKIM (by selector), and MX lookups in one shot
 - SQLite persistence with duplicate-report detection — re-importing files
   you already loaded is a no-op
+- Treats report files as untrusted: anyone can mail your `rua=` address, so
+  reports over 25 MB uncompressed are refused, DTDs/entities are never
+  processed, and zips are read in memory, never extracted
 - Drag and drop onto the window or the Dock icon; Finder "Open With" works
-  for `.xml` and `.gz`
+  for `.xml`, `.gz` and `.zip`
 
 ## Install
 
-### Option A — Download the app
-
-1. Grab the zip for your Mac from
-   [Releases](../../releases): `arm64` for Apple Silicon, `x86_64` for Intel.
-2. Unzip and move `DMARC Analyzer.app` to `/Applications`.
-3. **First launch:** the app is not notarized with Apple, so macOS will
-   block it. Open it once anyway:
-   - macOS 15 (Sequoia) and later: double-click the app (it will be
-     blocked), then go to **System Settings → Privacy & Security**, scroll
-     down, and click **Open Anyway**.
-   - macOS 13–14: right-click the app → **Open** → **Open**.
-   - Terminal alternative (any version):
-     `xattr -dr com.apple.quarantine "/Applications/DMARC Analyzer.app"`
-
-   This is a one-time step. If that friction is unacceptable for your
-   users, see "Signing and notarization" below.
-
-### Option B — Run from source
-
-Needs Python 3.9+ with tkinter (python.org installers include it;
-Homebrew users: `brew install python-tk`).
+Clone the repo, then either build the standalone app or run it straight from
+source. Both need Python 3.10+ **with tkinter** — the python.org installer
+includes it (Homebrew users: `brew install python-tk`). The Python 3.9 that
+ships with macOS is too old.
 
 ```bash
 git clone https://github.com/goetchstone/dmarc-analyzer.git
 cd dmarc-analyzer
-pip3 install dnspython tkinterdnd2
-python3 dmarc_analyzer.py
 ```
 
-Or install as a command with [pipx](https://pipx.pypa.io):
+### Build the app (recommended)
+
+Produces a self-contained `DMARC Analyzer.app` that bundles its own Python
+runtime, dnspython, and tkinterdnd2 — the finished bundle needs nothing
+installed to run. Because it's built locally, it carries no quarantine flag,
+so there's no Gatekeeper "Open Anyway" prompt.
 
 ```bash
-pipx install "dmarc-analyzer[dnd] @ git+https://github.com/goetchstone/dmarc-analyzer.git"
-dmarc-analyzer
+./build_app.sh            # builds dist/DMARC Analyzer.app
+./build_app.sh --install  # also copies it to /Applications
 ```
 
-### Option C — Build the app yourself
+The script creates a throwaway `build_venv`, so it won't touch your system
+Python. A build usually takes under a minute.
 
-Building locally avoids the Gatekeeper prompt entirely (locally built apps
-are never quarantined):
+### Run from source
+
+To run it directly without building a bundle, use a virtual environment
+(Homebrew's Python refuses a global `pip3 install`):
 
 ```bash
-./build_app.sh --install
+python3 -m venv .venv
+.venv/bin/pip install dnspython tkinterdnd2
+.venv/bin/python dmarc_analyzer.py
 ```
 
-See the script for build-machine requirements; the resulting app needs
-nothing installed.
+`tkinterdnd2` is optional — it only adds native Finder drag-and-drop; the app
+runs without it.
 
 ## Reading your results
 
@@ -90,30 +89,15 @@ nothing installed.
 A synthetic sample report you can try immediately is at
 `tests/fixtures/sample_report.xml`.
 
-## For maintainers
+## Tests
 
-**Releasing:** push a version tag and CI does the rest —
+The core suite (parsing of every supported format, hostile-input handling,
+SQLite persistence and DNS result colouring) runs headless with only the
+standard library — no dependencies and no display needed:
 
 ```bash
-git tag v1.1.0
-git push --tags
+python3 tests/test_core.py
 ```
-
-The `release` workflow runs the test suite, builds the app on GitHub's
-macOS runners (arm64 + Intel), and attaches both zips to the release.
-The `tests` workflow runs the stdlib-only suite on every push and PR.
-
-**Known caveats:**
-
-- GitHub has been retiring Intel (`macos-13`) runners. If the x86_64 job
-  fails with a runner-not-found error, delete that matrix entry in
-  `.github/workflows/release.yml`; Intel users can run from source.
-- **Signing and notarization:** release builds are unsigned, hence the
-  Gatekeeper step above. Removing it requires an Apple Developer Program
-  membership (US$99/year), a Developer ID Application certificate, and
-  adding `codesign` + `notarytool` steps to the release workflow with the
-  certificate and an App Store Connect API key stored as repo secrets.
-  Until then, every downloader sees the "Open Anyway" flow once.
 
 ## License
 
