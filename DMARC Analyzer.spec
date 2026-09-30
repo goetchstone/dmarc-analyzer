@@ -55,7 +55,7 @@ app = BUNDLE(
     coll,
     name="DMARC Analyzer.app",
     icon="dmarc.icns" if os.path.exists("dmarc.icns") else None,
-    bundle_identifier="com.saybrookhome.dmarc-analyzer",
+    bundle_identifier="io.github.goetchstone.dmarc-analyzer",
     info_plist={
         "CFBundleName": "DMARC Analyzer",
         "CFBundleDisplayName": "DMARC Analyzer",
