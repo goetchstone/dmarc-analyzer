@@ -10,3 +10,6 @@ __pycache__/
 # Local databases and macOS clutter
 *.db
 .DS_Store
+
+# Local virtual environment (README: run from source)
+.venv/
